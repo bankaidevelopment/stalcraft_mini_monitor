@@ -1,0 +1,258 @@
+# -*- coding: utf-8 -*-
+"""
+Мини-монитор: показывает выбранный участок экрана в реальном времени
+в отдельном плавающем окне (картинка в картинке).
+
+Как пользоваться:
+  1. Запусти:  python mini_monitor.py
+  2. Экран накроет прозрачная рамка — растяни прямоугольник вокруг
+     нужного участка (например, миникарты) и отпусти кнопку мыши.
+  3. Появится окно-виджет с этой областью в реальном времени.
+  4. Управление окном:
+       - перетаскивание мышью  — двигать окно
+       - колесо мыши           — менять размер (масштаб)
+       - двойной клик          — включить/выключить режим "прозрачный фон"
+                                 (скриншот-пиксели только с этого участка)
+       - ПКМ                   — меню: выбрать зону заново, поверх всех
+                                 окон, поверх игры, выход
+  Позиция/размер/выбранная зона сохраняются в mini_monitor.json.
+"""
+
+import ctypes
+import json
+import os
+import sys
+import tkinter as tk
+
+import mss
+from PIL import Image, ImageTk
+
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mini_monitor.json")
+TARGET_FPS = 60          # частота обновления участка
+SELECTION_ALPHA = 0.25   # затемнение экрана в режиме выбора
+
+
+class RegionSelector:
+    """Полноэкранная рамка для выбора области мышью."""
+
+    def __init__(self):
+        self.result = None
+        self.root = tk.Tk()
+        self.root.attributes("-fullscreen", True)
+        self.root.attributes("-topmost", True)
+        self.root.attributes("-alpha", SELECTION_ALPHA)
+        self.root.configure(bg="black", cursor="crosshair")
+        self.root.title("Выделите участок мышью")
+
+        self.canvas = tk.Canvas(self.root, bg="black", highlightthickness=0)
+        self.canvas.pack(fill=tk.BOTH, expand=True)
+
+        self.start = None
+        self.rect = None
+        self.text = self.canvas.create_text(
+            20, 20, anchor="nw", fill="white", font=("Segoe UI", 14),
+            text="Растяните прямоугольник вокруг нужного участка (например, миникарты)\n"
+                 "ЛКМ — начать, отпустить — выбрать.  ESC — отмена.",
+        )
+
+        self.canvas.bind("<ButtonPress-1>", self.on_press)
+        self.canvas.bind("<B1-Motion>", self.on_drag)
+        self.canvas.bind("<ButtonRelease-1>", self.on_release)
+        self.root.bind("<Escape>", lambda e: self.root.destroy())
+
+    def on_press(self, event):
+        self.start = (event.x, event.y)
+        if self.rect:
+            self.canvas.delete(self.rect)
+        self.rect = self.canvas.create_rectangle(
+            event.x, event.y, event.x, event.y,
+            outline="#3b82f6", width=2, fill="#3b82f6", stipple="gray25",
+        )
+
+    def on_drag(self, event):
+        if not self.start:
+            return
+        self.canvas.coords(self.rect, self.start[0], self.start[1], event.x, event.y)
+
+    def on_release(self, event):
+        if not self.start:
+            return
+        x1, y1 = self.start
+        x2, y2 = event.x, event.y
+        left, top = min(x1, x2), min(y1, y2)
+        w, h = abs(x2 - x1), abs(y2 - y1)
+        self.root.destroy()
+        if w > 4 and h > 4:
+            self.result = {"left": left, "top": top, "width": w, "height": h}
+
+    def run(self):
+        self.root.mainloop()
+        return self.result
+
+
+class MonitorWindow:
+    """Плавающее окно, показывающее выбранную область экрана в реальном времени."""
+
+    def __init__(self, region, cfg):
+        self.region = region
+        self.cfg = cfg
+        self.frame_time = int(1000 / TARGET_FPS)
+
+        self.root = tk.Tk()
+        self.root.title("Мини-монитор")
+        self.root.attributes("-topmost", True)
+        self.root.resizable(False, False)
+        self.root.overrideredirect(bool(cfg.get("borderless", True)))  # без рамки
+        self.root.attributes("-alpha", cfg.get("opacity", 1.0))
+
+        self.label = tk.Label(self.root, bd=0)
+        self.label.pack()
+
+        self.screenshot = mss.mss()
+        self.img = None
+        self._drag_start = None
+
+        # события
+        self.label.bind("<ButtonPress-1>", self.drag_begin)
+        self.label.bind("<ButtonRelease-1>", self.drag_end)
+        self.label.bind("<B1-Motion>", self.drag_move)
+        self.label.bind("<MouseWheel>", self.on_wheel)          # Windows
+        self.label.bind("<Button-4>", self.on_wheel)            # Linux
+        self.label.bind("<Button-5>", self.on_wheel)
+        self.label.bind("<Double-Button-1>", self.toggle_clickthrough)
+        self.label.bind("<Button-3>", self.show_menu)
+        self.root.bind("<Escape>", lambda e: self.quit())
+
+        self.menu = tk.Menu(self.root, tearoff=0)
+        self.menu.add_command(label="Выбрать участок заново", command=self.reselect)
+        self.clickthrough_var = tk.BooleanVar(value=cfg.get("clickthrough", False))
+        self.menu.add_checkbutton(
+            label="Клики проходят сквозь окно", variable=self.clickthrough_var,
+            command=self.toggle_clickthrough,
+        )
+        self.menu.add_command(label="С рамкой / без рамки", command=self.toggle_border)
+        self.menu.add_separator()
+        self.menu.add_command(label="Выход", command=self.quit)
+
+        self.root.geometry(f"+{cfg.get('x', 100)}+{cfg.get('y', 100)}")
+        self.running = True
+        self.root.after(0, self._apply_clickthrough)
+        self.root.after(0, self.update_frame)
+        self.root.protocol("WM_DELETE_WINDOW", self.quit)
+        self.root.mainloop()
+
+    # ---- захват и отрисовка -------------------------------------------------
+    def update_frame(self):
+        if not self.running:
+            return
+        try:
+            shot = self.screenshot.grab(self.region)
+            self.img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+        except Exception:
+            pass
+        if self.img:
+            scale = self.cfg.get("scale", 1.0)
+            w = max(8, int(self.region["width"] * scale))
+            h = max(8, int(self.region["height"] * scale))
+            shown = self.img.resize((w, h), Image.BILINEAR) if (w, h) != self.img.size else self.img
+            self._photo = ImageTk.PhotoImage(shown)
+            self.label.configure(image=self._photo, width=w, height=h)
+        self.root.after(self.frame_time, self.update_frame)
+
+    # ---- взаимодействие ------------------------------------------------------
+    def drag_begin(self, event):
+        self._drag_start = (event.x, event.y)
+        self.root.configure(cursor="fleur")
+
+    def drag_move(self, event):
+        if self._drag_start:
+            dx = event.x - self._drag_start[0]
+            dy = event.y - self._drag_start[1]
+            self.root.geometry(f"+{self.root.winfo_x() + dx}+{self.root.winfo_y() + dy}")
+            self.cfg["x"], self.cfg["y"] = self.root.winfo_x(), self.root.winfo_y()
+
+    def drag_end(self, event=None):
+        self._drag_start = None
+        self.root.configure(cursor="")
+
+    def on_wheel(self, event):
+        step = 1.1 if (getattr(event, "delta", 0) > 0 or getattr(event, "num", 0) == 4) else 1 / 1.1
+        self.cfg["scale"] = max(0.2, min(4.0, self.cfg.get("scale", 1.0) * step))
+        self.save_cfg()
+
+    def toggle_clickthrough(self):
+        """Клики проходят сквозь окно (Windows: WS_EX_TRANSPARENT)."""
+        self.clickthrough_var.set(not self.clickthrough_var.get())
+        self.cfg["clickthrough"] = self.clickthrough_var.get()
+        self._apply_clickthrough()
+        self.save_cfg()
+
+    def _apply_clickthrough(self):
+        if sys.platform != "win32":
+            return
+        GWL_EXSTYLE = -20
+        WS_EX_LAYERED = 0x00080000
+        WS_EX_TRANSPARENT = 0x00000020
+        hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
+        style = ctypes.windll.user32.GetWindowLongPtrW(hwnd, GWL_EXSTYLE)
+        if self.cfg.get("clickthrough"):
+            style |= WS_EX_LAYERED | WS_EX_TRANSPARENT
+        else:
+            style &= ~WS_EX_TRANSPARENT
+        ctypes.windll.user32.SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style)
+
+    def toggle_border(self):
+        self.cfg["borderless"] = not self.cfg.get("borderless", True)
+        self.root.overrideredirect(self.cfg["borderless"])
+        self.drag_end()
+        self.save_cfg()
+
+    def show_menu(self, event):
+        self.menu.tk_popup(event.x_root, event.y_root)
+
+    def reselect(self):
+        self.save_cfg()
+        self.running = False
+        self.root.destroy()
+        sel = RegionSelector()
+        new_region = sel.run()
+        if new_region:
+            main(new_region)
+        else:
+            main(self.region)
+
+    def quit(self):
+        self.cfg["x"], self.cfg["y"] = self.root.winfo_x(), self.root.winfo_y()
+        self.save_cfg()
+        self.running = False
+        self.root.destroy()
+
+    def save_cfg(self):
+        try:
+            self.cfg["region"] = self.region
+            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(self.cfg, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+
+def main(region=None):
+    cfg = {}
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        except Exception:
+            cfg = {}
+    if region is None:
+        region = cfg.get("region")
+    if region is None:
+        sel = RegionSelector()
+        region = sel.run()
+        if not region:
+            return
+    MonitorWindow(region, cfg)
+
+
+if __name__ == "__main__":
+    main()
